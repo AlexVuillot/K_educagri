@@ -1,0 +1,12 @@
+{
+  "name": "kahoot-ws",
+  "version": "1.0.0",
+  "description": "Quiz temps réel websocket",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
