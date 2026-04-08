@@ -196,6 +196,7 @@ function generateCode() {
 function generateId() {
     return Math.random().toString(36).substring(2, 12);
 }
-server.listen(3000, () => {
-    console.log('Serveur quiz sur le port 3000');
+const PORT = process.env.PORT || 3000; // Utilise le port fourni par Render, sinon 3000 pour local
+server.listen(PORT, () => {
+    console.log(`Serveur quiz sur le port ${PORT}`);
 });
