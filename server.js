@@ -5,7 +5,58 @@ const server = http.createServer();
 const wss = new WebSocket.Server({ server });
 // État du jeu
 const games = new Map(); // gameCode -> { host, players, currentQuestion, answers, scores }
+
+// Envoie un message et considère la connexion morte si ça échoue (socket fermé/cassé)
+function safeSend(ws, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+    try {
+        ws.send(JSON.stringify(payload));
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// Relance l'envoi de QUESTION_START aux élèves qui n'ont pas encore accusé réception
+function retryUnacked(game, questionIndex) {
+    if (!game || game.currentQuestion !== questionIndex) return; // question déjà changée, on arrête
+    if (game.pendingAcks.size === 0) return; // tout le monde a confirmé
+
+    game.retryCount = (game.retryCount || 0) + 1;
+
+    game.pendingAcks.forEach((playerId) => {
+        const player = game.players.get(playerId);
+        if (player) {
+            safeSend(player.ws, {
+                type: 'QUESTION_START',
+                questionIndex: game.currentQuestion,
+                optionCount: game.optionCount,
+                timeLimit: game.timeLimit
+            });
+        } else {
+            // L'élève n'existe plus (déconnecté) : on l'enlève des en-attente
+            game.pendingAcks.delete(playerId);
+        }
+    });
+
+    // Prévient le prof en direct de l'état des accusés de réception
+    safeSend(game.host, {
+        type: 'ACK_STATUS',
+        received: game.players.size - game.pendingAcks.size,
+        total: game.players.size,
+        pendingNames: Array.from(game.pendingAcks).map(id => game.players.get(id)?.name).filter(Boolean)
+    });
+
+    // On retente 3 fois maximum, toutes les 2 secondes, puis on abandonne (le prof est prévenu)
+    if (game.retryCount < 3 && game.pendingAcks.size > 0) {
+        game.ackTimer = setTimeout(() => retryUnacked(game, questionIndex), 2000);
+    }
+}
+
 wss.on('connection', (ws) => {
+    ws.isAlive = true;
+    ws.on('pong', () => { ws.isAlive = true; });
+
     ws.on('message', (data) => {
         const msg = JSON.parse(data);
         
@@ -53,20 +104,45 @@ wss.on('connection', (ws) => {
             case 'START_QUESTION':
                 const g = games.get(ws.gameCode);
                 if (g && ws.role === 'host') {
+                    // Annule un éventuel cycle de relance de la question précédente
+                    if (g.ackTimer) clearTimeout(g.ackTimer);
+
                     g.currentQuestion = msg.questionIndex;
                     g.questionStartTime = Date.now();
                     g.answers = [];
                     g.correctAnswer = msg.correctAnswer;
+                    g.optionCount = msg.optionCount;
                     g.timeLimit = msg.timeLimit || 20000; // 20s par défaut
-                    
-                    // Envoie à tous les élèves
-                    g.players.forEach((player) => {
-                        player.ws.send(JSON.stringify({
+                    g.retryCount = 0;
+                    // On attend un accusé de réception de tous les élèves actuellement connectés
+                    g.pendingAcks = new Set(g.players.keys());
+
+                    // Envoie à tous les élèves (individuellement pour repérer les échecs immédiats)
+                    g.players.forEach((player, playerId) => {
+                        const ok = safeSend(player.ws, {
                             type: 'QUESTION_START',
                             questionIndex: msg.questionIndex,
                             optionCount: msg.optionCount,
                             timeLimit: g.timeLimit
-                        }));
+                        });
+                        if (!ok) g.pendingAcks.delete(playerId); // socket déjà morte, inutile d'attendre son ack
+                    });
+
+                    // Première relance programmée 2s plus tard pour ceux qui n'ont pas confirmé
+                    g.ackTimer = setTimeout(() => retryUnacked(g, g.currentQuestion), 2000);
+                }
+                break;
+
+            // Un élève confirme la réception de la question
+            case 'QUESTION_ACK':
+                const gAck = games.get(ws.gameCode);
+                if (gAck && ws.role === 'player' && gAck.pendingAcks) {
+                    gAck.pendingAcks.delete(ws.playerId);
+                    safeSend(gAck.host, {
+                        type: 'ACK_STATUS',
+                        received: gAck.players.size - gAck.pendingAcks.size,
+                        total: gAck.players.size,
+                        pendingNames: Array.from(gAck.pendingAcks).map(id => gAck.players.get(id)?.name).filter(Boolean)
                     });
                 }
                 break;
@@ -190,6 +266,21 @@ wss.on('connection', (ws) => {
         }
     });
 });
+// Heartbeat : détecte les connexions mortes (coupure réseau, onglet fermé sans "close" propre)
+// et les nettoie pour ne pas attendre indéfiniment leur accusé de réception
+const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            ws.terminate(); // déclenche 'close' -> nettoyage normal du joueur dans la partie
+            return;
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 15000);
+
+wss.on('close', () => clearInterval(heartbeatInterval));
+
 function generateCode() {
     return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
