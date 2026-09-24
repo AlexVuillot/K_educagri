@@ -47,8 +47,11 @@ function retryUnacked(game, questionIndex) {
         pendingNames: Array.from(game.pendingAcks).map(id => game.players.get(id)?.name).filter(Boolean)
     });
 
-    // On retente 3 fois maximum, toutes les 2 secondes, puis on abandonne (le prof est prévenu)
-    if (game.retryCount < 3 && game.pendingAcks.size > 0) {
+    // On retente toutes les 2 secondes tant qu'il reste des élèves n'ayant pas confirmé.
+    // Ça s'arrête tout seul dès qu'un élève confirme, se déconnecte, ou qu'une nouvelle
+    // question démarre (voir le test en haut de la fonction). Le prof, lui, peut décider
+    // à tout moment de continuer sans attendre (bouton côté Storyline), sans dépendre de ça.
+    if (game.pendingAcks.size > 0) {
         game.ackTimer = setTimeout(() => retryUnacked(game, questionIndex), 2000);
     }
 }
@@ -58,9 +61,16 @@ wss.on('connection', (ws) => {
     ws.on('pong', () => { ws.isAlive = true; });
 
     ws.on('message', (data) => {
-        const msg = JSON.parse(data);
-        
-        switch (msg.type) {
+        let msg;
+        try {
+            msg = JSON.parse(data);
+        } catch (e) {
+            // Message corrompu ou mal formé : on l'ignore plutôt que de planter tout le serveur
+            return;
+        }
+
+        try {
+            switch (msg.type) {
             // Le prof crée une partie
             case 'CREATE_GAME':
                 const code = generateCode();
@@ -100,6 +110,67 @@ wss.on('connection', (ws) => {
                 }
                 break;
             
+            // Un élève qui avait déjà un playerId (coupure réseau, page rechargée) revient
+            // dans la partie SANS perdre son score ni redevenir un inconnu pour le prof.
+            case 'REJOIN_GAME':
+                const gameJoin = games.get(msg.code);
+                const existingPlayer = gameJoin?.players.get(msg.playerId);
+                if (gameJoin && existingPlayer) {
+                    // Annule la suppression programmée suite à la déconnexion
+                    if (existingPlayer.disconnectTimer) {
+                        clearTimeout(existingPlayer.disconnectTimer);
+                        existingPlayer.disconnectTimer = null;
+                    }
+                    existingPlayer.ws = ws;
+                    ws.gameCode = msg.code;
+                    ws.role = 'player';
+                    ws.playerId = msg.playerId;
+                    ws.playerName = existingPlayer.name;
+
+                    ws.send(JSON.stringify({
+                        type: 'REJOINED',
+                        playerId: msg.playerId,
+                        score: gameJoin.scores.get(msg.playerId) || 0
+                    }));
+
+                    gameJoin.host?.send(JSON.stringify({
+                        type: 'PLAYER_RECONNECTED',
+                        playerId: msg.playerId,
+                        name: existingPlayer.name,
+                        playerCount: gameJoin.players.size
+                    }));
+
+                    // Si une question est en cours et qu'il ne l'avait pas encore confirmée,
+                    // le cycle de relance déjà en route la lui renverra automatiquement.
+                    // Si en revanche les résultats de la question ont déjà été révélés par
+                    // le prof pendant qu'il était déconnecté, on lui renvoie son feedback ici
+                    // (sinon il resterait bloqué indéfiniment sur le slide d'attente des résultats).
+                    if (gameJoin.resultsSent) {
+                        const pastAnswer = gameJoin.answers.find(a => a.playerId === msg.playerId);
+                        if (pastAnswer) {
+                            safeSend(ws, {
+                                type: 'QUESTION_RESULT',
+                                correct: pastAnswer.correct,
+                                points: pastAnswer.points,
+                                totalScore: gameJoin.scores.get(msg.playerId)
+                            });
+                        } else {
+                            safeSend(ws, {
+                                type: 'QUESTION_RESULT',
+                                correct: false,
+                                points: 0,
+                                answered: false,
+                                totalScore: gameJoin.scores.get(msg.playerId) || 0
+                            });
+                        }
+                    }
+                } else {
+                    // Le serveur a redémarré ou la partie n'existe plus : impossible de reprendre
+                    // l'ancienne identité, il faut rejoindre comme un nouvel élève.
+                    ws.send(JSON.stringify({ type: 'REJOIN_FAILED' }));
+                }
+                break;
+            
             // Le prof lance une question
             case 'START_QUESTION':
                 const g = games.get(ws.gameCode);
@@ -114,6 +185,7 @@ wss.on('connection', (ws) => {
                     g.optionCount = msg.optionCount;
                     g.timeLimit = msg.timeLimit || 20000; // 20s par défaut
                     g.retryCount = 0;
+                    g.resultsSent = false;
                     // On attend un accusé de réception de tous les élèves actuellement connectés
                     g.pendingAcks = new Set(g.players.keys());
 
@@ -151,10 +223,18 @@ wss.on('connection', (ws) => {
             case 'ANSWER':
                 const gm = games.get(ws.gameCode);
                 if (gm && ws.role === 'player' && gm.currentQuestion !== null) {
-                    const responseTime = Date.now() - gm.questionStartTime;
                     const alreadyAnswered = gm.answers.some(a => a.playerId === ws.playerId);
-                    
-                    if (!alreadyAnswered && responseTime <= gm.timeLimit) {
+
+                    if (alreadyAnswered) {
+                        // Renvoi (retenté par l'élève après une coupure) d'une réponse déjà
+                        // enregistrée : on confirme à nouveau sans recompter les points, pour
+                        // que le client arrête ses tentatives.
+                        safeSend(ws, { type: 'ANSWER_RECEIVED' });
+                        break;
+                    }
+
+                    const responseTime = Date.now() - gm.questionStartTime;
+                    if (responseTime <= gm.timeLimit) {
                         const isCorrect = msg.answer === gm.correctAnswer;
                         // Points basés sur la rapidité (max 1000)
                         const points = isCorrect 
@@ -173,14 +253,14 @@ wss.on('connection', (ws) => {
                         gm.scores.set(ws.playerId, (gm.scores.get(ws.playerId) || 0) + points);
                         
                         // Confirme à l'élève
-                        ws.send(JSON.stringify({ type: 'ANSWER_RECEIVED' }));
+                        safeSend(ws, { type: 'ANSWER_RECEIVED' });
                         
                         // Notifie le prof du nombre de réponses
-                        gm.host.send(JSON.stringify({
+                        safeSend(gm.host, {
                             type: 'ANSWER_COUNT',
                             count: gm.answers.length,
                             total: gm.players.size
-                        }));
+                        });
                     }
                 }
                 break;
@@ -189,6 +269,12 @@ wss.on('connection', (ws) => {
             case 'GET_RESULTS':
                 const gme = games.get(ws.gameCode);
                 if (gme && ws.role === 'host') {
+                    gme.resultsSent = true; // permet de rattraper un élève qui se reconnecte après coup
+                    // Les résultats sont révélés : inutile (et perturbant) de continuer à
+                    // renvoyer QUESTION_START à des élèves qui n'avaient pas encore confirmé.
+                    if (gme.ackTimer) clearTimeout(gme.ackTimer);
+                    gme.pendingAcks?.clear();
+
                     // Compte par option
                     const distribution = {};
                     gme.answers.forEach(a => {
@@ -214,16 +300,30 @@ wss.on('connection', (ws) => {
                         totalPlayers: gme.players.size
                     }));
                     
-                    // Envoie le feedback à chaque élève
+                    // Envoie le feedback à ceux qui ont répondu
+                    const answeredIds = new Set();
                     gme.answers.forEach(a => {
+                        answeredIds.add(a.playerId);
                         const playerWs = gme.players.get(a.playerId)?.ws;
-                        if (playerWs) {
-                            playerWs.send(JSON.stringify({
+                        safeSend(playerWs, {
+                            type: 'QUESTION_RESULT',
+                            correct: a.correct,
+                            points: a.points,
+                            totalScore: gme.scores.get(a.playerId)
+                        });
+                    });
+
+                    // Et un feedback "pas de réponse" à ceux qui n'ont pas répondu, sinon ils
+                    // resteraient bloqués indéfiniment sur le slide d'attente des résultats.
+                    gme.players.forEach((p, id) => {
+                        if (!answeredIds.has(id)) {
+                            safeSend(p.ws, {
                                 type: 'QUESTION_RESULT',
-                                correct: a.correct,
-                                points: a.points,
-                                totalScore: gme.scores.get(a.playerId)
-                            }));
+                                correct: false,
+                                points: 0,
+                                answered: false,
+                                totalScore: gme.scores.get(id) || 0
+                            });
                         }
                     });
                 }
@@ -241,27 +341,38 @@ wss.on('connection', (ws) => {
                         .sort((a, b) => b.score - a.score);
                     
                     // Notifie tout le monde
-                    const endMsg = JSON.stringify({
+                    const endPayload = {
                         type: 'GAME_ENDED',
                         leaderboard: finalLeaderboard
-                    });
-                    gmf.players.forEach(p => p.ws.send(endMsg));
-                    ws.send(endMsg);
+                    };
+                    gmf.players.forEach(p => safeSend(p.ws, endPayload));
+                    safeSend(ws, endPayload);
                 }
                 break;
+        }
+        } catch (e) {
+            // Une erreur inattendue dans le traitement d'un message ne doit jamais faire
+            // tomber le serveur entier ni les autres parties en cours.
+            console.error('Erreur de traitement de message:', e);
         }
     });
     
     ws.on('close', () => {
         if (ws.role === 'player' && ws.gameCode) {
             const game = games.get(ws.gameCode);
-            if (game) {
-                game.players.delete(ws.playerId);
-                game.host?.send(JSON.stringify({
-                    type: 'PLAYER_LEFT',
-                    playerId: ws.playerId,
-                    playerCount: game.players.size
-                }));
+            const player = game?.players.get(ws.playerId);
+            // On ne retire l'élève que si ce socket est toujours "le sien" : s'il s'est déjà
+            // reconnecté (REJOIN_GAME a remplacé player.ws), on ignore cette fermeture tardive.
+            if (game && player && player.ws === ws) {
+                player.disconnectTimer = setTimeout(() => {
+                    game.players.delete(ws.playerId);
+                    game.pendingAcks?.delete(ws.playerId);
+                    game.host?.send(JSON.stringify({
+                        type: 'PLAYER_LEFT',
+                        playerId: ws.playerId,
+                        playerCount: game.players.size
+                    }));
+                }, 20000); // 20s de grâce pour laisser le temps à une reconnexion
             }
         }
     });
